@@ -3,14 +3,15 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 
 use ethereum_types::Address;
+use foundry_evm::executor::{fork::MultiFork, Backend, ExecutorBuilder, RawCallResult};
 use halo2_curves::bn256::{Bn256, Fq, Fr, G1Affine};
 use halo2_kzg_srs::{Srs, SrsFormat};
 use halo2_proofs::{
-    circuit::{Layouter, Value, SimpleFloorPlanner},
+    circuit::{floor_planner::V1, Layouter, Value},
     dev::MockProver,
     plonk::{
         self, create_proof, keygen_pk, keygen_vk, verify_proof, Circuit, ConstraintSystem,
-        ProvingKey, VerifyingKey as PlonkVerifyingKey, Error
+        ProvingKey, VerifyingKey as PlonkVerifyingKey,
     },
     poly::{
         commitment::{Params, ParamsProver},
@@ -32,28 +33,36 @@ use halo2_wrong_ecc::{
     },
     EccConfig,
 };
+use halo2_wrong_transcript::NativeRepresentation;
 use itertools::Itertools;
-use snark_verifier::{
+use plonk_verifier::{
     cost::CostEstimation,
     loader::{
-        evm::{encode_calldata, compile_yul, EvmLoader, ExecutorBuilder, RawCallResult},
-        halo2,
+        evm::{encode_calldata, EvmLoader},
+        halo2::{self},
         native::NativeLoader,
     },
     pcs::{
-        kzg::*, AccumulationScheme, AccumulationSchemeProver,
+        kzg::{
+            Gwc19, Kzg, KzgAccumulator, KzgAs, KzgAsProvingKey, KzgAsVerifyingKey,
+            KzgSuccinctVerifyingKey, LimbsEncoding,
+        },
+        AccumulationScheme, AccumulationSchemeProver, Decider,
     },
     system::{
-        self, circom::{compile, Proof, PublicSignals, VerifyingKey},
+        self,
+        circom::{compile, Proof, PublicSignals, VerifyingKey},
         halo2::{compile as compile_halo2, transcript::evm::EvmTranscript, Config},
     },
-    util::arithmetic::{fe_to_limbs, FieldExt},
-    verifier::{self, SnarkVerifier, plonk::*},
+    util::arithmetic::{fe_to_limbs, CurveAffine, FieldExt},
+    verifier::{self, PlonkVerifier},
+    Protocol,
 };
 use rand::{rngs::OsRng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use std::{
     io::{Cursor, Write},
+    iter,
     path::PathBuf,
     rc::Rc,
     time::Instant,
@@ -69,18 +78,24 @@ const RATE: usize = 16;
 const R_F: usize = 8;
 const R_P: usize = 10;
 
+type Pcs = Kzg<Bn256, Gwc19>;
 type Svk = KzgSuccinctVerifyingKey<G1Affine>;
-
-type As = KzgAs<Bn256, Gwc19>;
-type PlonkSuccinctVerifier = verifier::plonk::PlonkSuccinctVerifier<As, LimbsEncoding<LIMBS, BITS>>;
-type PlonkVerifier = verifier::plonk::PlonkVerifier<As, LimbsEncoding<LIMBS, BITS>>;
+type As = KzgAs<Pcs>;
+type AsPk = KzgAsProvingKey<G1Affine>;
+type AsVk = KzgAsVerifyingKey;
+type Plonk = verifier::Plonk<Pcs, LimbsEncoding<LIMBS, BITS>>;
 
 type BaseFieldEccChip = halo2_wrong_ecc::BaseFieldEccChip<G1Affine, LIMBS, BITS>;
-type Halo2Loader<'a> = halo2::Halo2Loader<'a, G1Affine, BaseFieldEccChip>;
-type PoseidonTranscript<L, S> = system::circom::transcript::halo2::PoseidonTranscript<
+type Halo2Loader<'a> = halo2::Halo2Loader<'a, G1Affine, Fr, BaseFieldEccChip>;
+type PoseidonTranscript<L, S, B> = system::circom::transcript::halo2::PoseidonTranscript<
     G1Affine,
+    Fr,
+    NativeRepresentation,
     L,
     S,
+    B,
+    LIMBS,
+    BITS,
     T,
     RATE,
     R_F,
@@ -116,10 +131,10 @@ impl MainGateWithRangeConfig {
         RangeChip::new(self.range_config.clone())
     }
 
-    pub fn ecc_chip(
+    pub fn ecc_chip<C: CurveAffine, const LIMBS: usize, const BITS: usize>(
         &self,
-    ) -> BaseFieldEccChip {
-        BaseFieldEccChip::new(EccConfig::new(
+    ) -> halo2_wrong_ecc::BaseFieldEccChip<C, LIMBS, BITS> {
+        halo2_wrong_ecc::BaseFieldEccChip::new(EccConfig::new(
             self.range_config.clone(),
             self.main_gate_config.clone(),
         ))
@@ -128,7 +143,7 @@ impl MainGateWithRangeConfig {
 
 #[derive(Clone)]
 pub struct SnarkWitness {
-    protocol: PlonkProtocol<G1Affine>,
+    protocol: Protocol<G1Affine>,
     instances: Vec<Vec<Value<Fr>>>,
     proof: Value<Vec<u8>>,
 }
@@ -151,11 +166,11 @@ impl SnarkWitness {
     }
 }
 
-pub fn aggregate<'a>(
+pub fn accumulate<'a>(
     svk: &Svk,
     loader: &Rc<Halo2Loader<'a>>,
     snarks: &[SnarkWitness],
-    as_vk: &KzgAsVerifyingKey,
+    as_vk: &AsVk,
     as_proof: Value<&'_ [u8]>,
 ) -> KzgAccumulator<G1Affine, Rc<Halo2Loader<'a>>> {
     let assign_instances = |instances: &[Vec<Value<Fr>>]| {
@@ -170,24 +185,24 @@ pub fn aggregate<'a>(
             .collect_vec()
     };
 
-    let accumulators = snarks
+    let mut accumulators = snarks
         .iter()
         .flat_map(|snark| {
-            let protocol = snark.protocol.loaded(loader);
             let instances = assign_instances(&snark.instances);
             let mut transcript =
-                PoseidonTranscript::<Rc<Halo2Loader>, _>::new(loader, snark.proof());
+                PoseidonTranscript::<Rc<Halo2Loader>, _, _>::new(loader, snark.proof());
             let proof =
-                PlonkSuccinctVerifier::read_proof(svk, &protocol, &instances, &mut transcript).unwrap();
-            PlonkSuccinctVerifier::verify(svk, &protocol, &instances, &proof).unwrap()
+                Plonk::read_proof(svk, &snark.protocol, &instances, &mut transcript).unwrap();
+            Plonk::succinct_verify(svk, &snark.protocol, &instances, &proof).unwrap()
         })
         .collect_vec();
 
-    let accumulator = {
-        let mut transcript = PoseidonTranscript::<Rc<Halo2Loader>, _>::new(loader, as_proof);
-        let proof =
-            As::read_proof(as_vk, &accumulators, &mut transcript).unwrap();
+    let accumulator = if accumulators.len() > 1 {
+        let mut transcript = PoseidonTranscript::<Rc<Halo2Loader>, _, _>::new(loader, as_proof);
+        let proof = As::read_proof(as_vk, &accumulators, &mut transcript).unwrap();
         As::verify(as_vk, &accumulators, &proof).unwrap()
+    } else {
+        accumulators.pop().unwrap()
     };
 
     accumulator
@@ -198,7 +213,7 @@ struct Accumulation {
     svk: Svk,
     snarks: Vec<SnarkWitness>,
     instances: Vec<Fr>,
-    as_vk: KzgAsVerifyingKey,
+    as_vk: AsVk,
     as_proof: Value<Vec<u8>>,
 }
 
@@ -217,17 +232,17 @@ impl Accumulation {
             .flat_map(|(public_signal, proof)| {
                 let instances = [public_signal.clone().to_vec(); 1];
                 let mut transcript =
-                    PoseidonTranscript::<NativeLoader, _>::new(proof.as_slice());
+                    PoseidonTranscript::<NativeLoader, _, _>::new(proof.as_slice());
                 let proof =
-                    PlonkSuccinctVerifier::read_proof(&vk.svk().into(), &protocol, &instances, &mut transcript)
+                    Plonk::read_proof(&vk.svk().into(), &protocol, &instances, &mut transcript)
                         .unwrap();
-                PlonkSuccinctVerifier::verify(&vk.svk().into(), &protocol, &instances, &proof).unwrap()
+                Plonk::succinct_verify(&vk.svk().into(), &protocol, &instances, &proof).unwrap()
             })
             .collect_vec();
 
-        let as_pk = KzgAsProvingKey::<G1Affine>::new(Some(vk.apk()));
+        let as_pk = AsPk::new(Some(vk.apk()));
         let (accumulator, as_proof) = if accumulators.len() > 1 {
-            let mut transcript = PoseidonTranscript::<NativeLoader, _>::new(Vec::new());
+            let mut transcript = PoseidonTranscript::<NativeLoader, _, _>::new(Vec::new());
             let accumulator = As::create_proof(
                 &as_pk,
                 &accumulators,
@@ -239,6 +254,8 @@ impl Accumulation {
         } else {
             (accumulators.pop().unwrap(), Value::unknown())
         };
+
+        assert!(Pcs::decide(&vk.dk().into(), accumulator.clone()));
 
         let KzgAccumulator { lhs, rhs } = accumulator;
         let instances = [lhs.x, lhs.y, rhs.x, rhs.y]
@@ -285,7 +302,7 @@ impl Accumulation {
 
 impl Circuit<Fr> for Accumulation {
     type Config = MainGateWithRangeConfig;
-    type FloorPlanner = SimpleFloorPlanner;
+    type FloorPlanner = V1;
 
     fn without_witnesses(&self) -> Self {
         Self {
@@ -319,33 +336,36 @@ impl Circuit<Fr> for Accumulation {
 
         range_chip.load_table(&mut layouter)?;
 
-        let accumulator_limbs = layouter.assign_region(
+        let (lhs, rhs) = layouter.assign_region(
             || "",
             |region| {
                 let ctx = RegionCtx::new(region, 0);
 
                 let ecc_chip = config.ecc_chip();
                 let loader = Halo2Loader::new(ecc_chip, ctx);
-                let accumulator = aggregate(&self.svk, &loader, &self.snarks, &self.as_vk, self.as_proof());
+                let KzgAccumulator { lhs, rhs } = accumulate(
+                    &self.svk,
+                    &loader,
+                    &self.snarks,
+                    &self.as_vk,
+                    self.as_proof(),
+                );
 
-                let accumulator_limbs = [accumulator.lhs, accumulator.rhs]
-                    .iter()
-                    .map(|ec_point| {
-                        loader.ecc_chip().assign_ec_point_to_limbs(
-                            &mut loader.ctx_mut(),
-                            ec_point.assigned(),
-                        )
-                    })
-                    .collect::<Result<Vec<_>, Error>>()?
-                    .into_iter()
-                    .flatten();
+                // loader.print_row_metering();
+                // println!("Total row cost: {}", loader.ctx().offset());
 
-                Ok(accumulator_limbs)
+                Ok((lhs.assigned(), rhs.assigned()))
             },
         )?;
 
-        for (row, limb) in accumulator_limbs.enumerate() {
-            main_gate.expose_public(layouter.namespace(|| ""), limb, row)?;
+        for (limb, row) in iter::empty()
+            .chain(lhs.x().limbs())
+            .chain(lhs.y().limbs())
+            .chain(rhs.x().limbs())
+            .chain(rhs.y().limbs())
+            .zip(0..)
+        {
+            main_gate.expose_public(layouter.namespace(|| ""), limb.into(), row)?;
         }
 
         Ok(())
@@ -445,40 +465,40 @@ fn gen_aggregation_evm_verifier(
     num_instance: Vec<usize>,
     accumulator_indices: Vec<(usize, usize)>,
 ) -> Vec<u8> {
-    let g1 = vk.svk();
-    let (g2, s_g2) = vk.dk();
-    let dk = (g1, g2, s_g2).into();
+    let svk = vk.svk().into();
+    let dk = vk.dk().into();
 
     let protocol = compile_halo2(
         params,
         plonk_vk,
         Config::kzg()
             .with_num_instance(num_instance.clone())
-            .with_accumulator_indices(Some(accumulator_indices)),
+            .with_accumulator_indices(accumulator_indices),
     );
 
-    PlonkVerifier::estimate_cost(&protocol);
+    verifier::Plonk::<Kzg<Bn256, Gwc19>>::estimate_cost(&protocol);
 
     let loader = EvmLoader::new::<Fq, Fr>();
-    let protocol = protocol.loaded(&loader);
-    let mut transcript = EvmTranscript::<_, Rc<EvmLoader>, _, _>::new(&loader);
+    let mut transcript = EvmTranscript::<_, Rc<EvmLoader>, _, _>::new(loader.clone());
 
     let instances = transcript.load_instances(num_instance);
-    let proof = PlonkVerifier::read_proof(&dk, &protocol, &instances, &mut transcript).unwrap();
-    PlonkVerifier::verify(&dk, &protocol, &instances, &proof).unwrap();
+    let proof = Plonk::read_proof(&svk, &protocol, &instances, &mut transcript).unwrap();
+    Plonk::verify(&svk, &dk, &protocol, &instances, &proof).unwrap();
 
-    compile_yul(&loader.yul_code())
+    loader.deployment_code()
 }
 
 fn evm_verify(deployment_code: Vec<u8>, calldata: Vec<u8>) -> anyhow::Result<RawCallResult> {
     let mut evm = ExecutorBuilder::default()
         .with_gas_limit(u64::MAX.into())
-        .build();
+        .build(Backend::new(MultiFork::new().0, None));
 
     let caller = Address::from_low_u64_be(0xfe);
-    let verifier = evm.deploy(caller, deployment_code.into(), 0.into()).address.unwrap();
-
-    Ok(evm.call_raw(caller, verifier, calldata.into(), 0.into()))
+    let verifier = evm.deploy(caller, deployment_code.into(), 0.into(), None)?;
+    match evm.call_raw(caller, verifier.address, calldata.into(), 0.into()) {
+        Ok(result) => Ok(result),
+        Err(e) => Err(anyhow::anyhow!(e.to_string())),
+    }
 }
 
 fn prepare_params(path: PathBuf) -> anyhow::Result<ParamsKZG<Bn256>> {
@@ -611,8 +631,8 @@ enum Commands {
 
     /// EVM proof verify
     EvmVerifyProof {
-        calldata: PathBuf,
-        evmbytecode: PathBuf,
+        calldata_path: PathBuf,
+        evmbytecode_path: PathBuf,
     },
 
     /// Create Params
@@ -680,7 +700,9 @@ fn main() {
                 "Running mock prover for aggregation circuit".white().bold()
             );
             let now = Instant::now();
-            match MockProver::run(3, &circuit, vec![circuit.instances.clone()])
+            let dimension = DimensionMeasurement::measure(&circuit).unwrap();
+            match MockProver::run(dimension.k(), &circuit, vec![circuit.instances.clone()])
+            
                 .with_context(|| "Mock prover failed")
             {
                 Ok(mock_prover) => match mock_prover.verify() {
@@ -956,34 +978,34 @@ fn main() {
             }
             println!();
 
-            println!("{}", "Simulating evm verification".white().bold());
-            let verification_key = pk.get_vk();
-            let evm_bytecode = gen_aggregation_evm_verifier(
-                &circom_vk,
-                &params,
-                verification_key,
-                Accumulation::num_instance(),
-                Accumulation::accumulator_indices(),
-            );
-            match evm_verify(evm_bytecode, calldata.clone())
-                .with_context(|| "Simulating evm verification failed")
-            {
-                Ok(result) => {
-                    println!("{}", format!("Gas used: {}", result.gas_used).blue());
-                    if result.reverted {
-                        println!("{}", "Verification failed".red())
-                    } else {
-                        println!("{}", "Verification success".green())
-                    }
-                }
-                Err(e) => {
-                    println!("{}", format!("{:#?}", e).red());
-                }
-            }
-            println!();
+            // println!("{}", "Simulating evm verification".white().bold());
+            // let verification_key = pk.get_vk();
+            // let evm_bytecode = gen_aggregation_evm_verifier(
+            //     &circom_vk,
+            //     &params,
+            //     verification_key,
+            //     Accumulation::num_instance(),
+            //     Accumulation::accumulator_indices(),
+            // );
+            // match evm_verify(evm_bytecode, calldata.clone())
+            //     .with_context(|| "Simulating evm verification failed")
+            // {
+            //     Ok(result) => {
+            //         println!("{}", format!("Gas used: {}", result.gas_used).blue());
+            //         if result.reverted {
+            //             println!("{}", "Verification failed".red())
+            //         } else {
+            //             println!("{}", "Verification success".green())
+            //         }
+            //     }
+            //     Err(e) => {
+            //         println!("{}", format!("{:#?}", e).red());
+            //     }
+            // }
+            // println!();
 
-            println!("{}", format!("Calldata (in bytes):").blue().bold());
-            println!("{}", format!("{:?}", calldata).white().bold());
+            // println!("{}", format!("Calldata (in bytes):").blue().bold());
+            // println!("{}", format!("{:?}", calldata).white().bold());
         }
         Some(Commands::VerifyProof {
             verification_key,
@@ -1017,18 +1039,24 @@ fn main() {
             };
             assert!(proofs.len() == public_signals.len());
 
-            let agg_proof = match std::fs::read_to_string(proof_file.clone())
-                .with_context(|| format!("Failed to locate {}", proof_file.to_str().unwrap()))
-                .and_then(|proof| {
-                    let proof = serde_json::from_str::<Vec<u8>>(&proof)?;
-                    Ok(proof)
-                }) {
-                Ok(proof) => proof,
-                Err(e) => {
-                    println!("{}", format!("{:#?}", e).red());
-                    std::process::exit(1);
-                }
-            };
+
+            let mut file = std::fs::File::open(proof_file.clone()).expect("Unable to open file");
+            let mut agg_proof = vec![];
+            std::io::Read::read_to_end(&mut file, &mut agg_proof).expect("Unable to read");
+            
+
+            // let agg_proof = match std::fs::read_to_string(proof_file.clone())
+            //     .with_context(|| format!("Failed to locate {}", proof_file.to_str().unwrap()))
+            //     .and_then(|proof| {
+            //         let proof = serde_json::from_str::<Vec<u8>>(&proof)?;
+            //         Ok(proof)
+            //     }) {
+            //     Ok(proof) => proof,
+            //     Err(e) => {
+            //         println!("{}", format!("{:#?}", e).red());
+            //         std::process::exit(1);
+            //     }
+            // };
 
             println!("{}", "Reading parameters for the circuit".white().bold());
             let now = Instant::now();
@@ -1086,31 +1114,43 @@ fn main() {
             }
         }
         Some(Commands::EvmVerifyProof {
-            calldata,
-            evmbytecode,
+            calldata_path,
+            evmbytecode_path,
         }) => {
-            let (calldata, bytecode) = match std::fs::read_to_string(calldata.clone())
-                .with_context(|| format!("Failed to locate {}", calldata.to_str().unwrap()))
-                .and_then(|calldata| {
-                    let bytecode =
-                        std::fs::read_to_string(evmbytecode.clone()).with_context(|| {
-                            format!("Failed to locate {}", evmbytecode.to_str().unwrap())
-                        })?;
-                    Ok((calldata, bytecode))
-                })
-                .and_then(|(calldata, bytecode)| {
-                    let calldata = serde_json::from_str::<Vec<u8>>(&calldata)
-                        .with_context(|| "Failed to parse calldata")?;
-                    let bytecode = serde_json::from_str::<Vec<u8>>(&bytecode)
-                        .with_context(|| "Failed to parse evm bytecode")?;
-                    Ok((calldata, bytecode))
-                }) {
-                Ok(res) => res,
-                Err(e) => {
-                    println!("{}", format!("{:#?}", e).red());
-                    std::process::exit(1);
-                }
-            };
+
+
+            let mut calldata_file = std::fs::File::open(calldata_path.clone()).expect("Unable to open calldata_path");
+            let mut calldata = vec![];
+            std::io::Read::read_to_end(&mut calldata_file, &mut calldata).expect("Unable to read calldata");
+            
+            let mut evmbytecode_file = std::fs::File::open(evmbytecode_path.clone()).expect("Unable to open evmbytecode_path");
+            let mut bytecode = vec![];
+            std::io::Read::read_to_end(&mut evmbytecode_file, &mut bytecode).expect("Unable to read calldata");
+
+
+
+            // let (calldata, bytecode) = match std::fs::read_to_string(calldata.clone())
+            //     .with_context(|| format!("Failed to locate {}", calldata.to_str().unwrap()))
+            //     .and_then(|calldata| {
+            //         let bytecode =
+            //             std::fs::read_to_string(evmbytecode.clone()).with_context(|| {
+            //                 format!("Failed to locate {}", evmbytecode.to_str().unwrap())
+            //             })?;
+            //         Ok((calldata, bytecode))
+            //     })
+            //     .and_then(|(calldata, bytecode)| {
+            //         let calldata = serde_json::from_str::<Vec<u8>>(&calldata)
+            //             .with_context(|| "Failed to parse calldata")?;
+            //         let bytecode = serde_json::from_str::<Vec<u8>>(&bytecode)
+            //             .with_context(|| "Failed to parse evm bytecode")?;
+            //         Ok((calldata, bytecode))
+            //     }) {
+            //     Ok(res) => res,
+            //     Err(e) => {
+            //         println!("{}", format!("{:#?}", e).red());
+            //         std::process::exit(1);
+            //     }
+            // };
 
             match evm_verify(bytecode, calldata)
                 .with_context(|| "Simulating evm verification failed")

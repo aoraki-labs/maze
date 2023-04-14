@@ -7,7 +7,7 @@ That means using Maze you can take a bunch of plonk proofs that you generate usi
 ## Getting started
 
 ### Install [this fork](https://github.com/Janmajayamall/snarkjs) of Snarkjs
-
+(hao: this is done on zk test machine)
 > **Note:** this will override existing installation of [snarkjs](https://github.com/iden3/snarkjs) on your system.
 
 ```sh
@@ -25,7 +25,7 @@ The fork implements two changes to original [snarkjs](https://github.com/iden3/s
 -   adds `snarkjs plonk setupmaze` cli command that generates plonk proof of circuit for several inputs and outputs necessary files (i.e. plonk verification key, proofs, and public signals of each proof) for building aggregation circuit using [maze]().
 
 ### Install maze
-
+(hao: this is done on zk test machine)
 > You must have rust installed to build and install maze
 
 ```sh
@@ -136,6 +136,12 @@ Mock setup does the following
 
 ### 7. Maze gen-evm-verifier
 
+(hao: get hez 22 srs first.)
+
+```sh
+curl https://trusted-setup-halo2kzg.s3.eu-central-1.amazonaws.com/hermez-22 --output hez_22.srs
+```
+
 ```sh
 maze gen-evm-verifier verification_key.json proofs.json public_signals.json hez_22.srs outputs
 ```
@@ -168,6 +174,8 @@ maze verify-proof verification_key.json proofs.json public_signals.json outputs/
 `verify-proof` verifies the aggregated proof (stored in `halo2-agg-proof.txt`) generated using `create-proof`
 
 ### 10. Maze evm-verify-proof
+
+(hao: this step has problems. fixing.)
 
 ```sh
 maze evm-verify-proof outputs/halo2-agg-evm-calldata.txt outputs/evm-verifier.txt
