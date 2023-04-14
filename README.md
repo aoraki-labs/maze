@@ -136,7 +136,7 @@ Mock setup does the following
 
 ### 7. Maze gen-evm-verifier
 
-(hao: get hez 22 srs first.)
+(hao: get hez-22 srs first. srs file is 10x smaller than ptau file and loading speed is fast.)
 
 ```sh
 curl https://trusted-setup-halo2kzg.s3.eu-central-1.amazonaws.com/hermez-22 --output hez_22.srs
@@ -175,7 +175,7 @@ maze verify-proof verification_key.json proofs.json public_signals.json outputs/
 
 ### 10. Maze evm-verify-proof
 
-(hao: this step has problems. fixing.)
+(hao: this step has problems. under fixing. https://github.com/privacy-scaling-explorations/maze/issues/6)
 
 ```sh
 maze evm-verify-proof outputs/halo2-agg-evm-calldata.txt outputs/evm-verifier.txt
